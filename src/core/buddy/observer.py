@@ -6,18 +6,16 @@ Two modes:
    with conversation history so it remembers recent exchanges
 
 Runs in a background thread to avoid blocking the REPL.
-Uses the cheapest model (haiku) to minimize cost and latency.
+Uses the configured companion model.
 """
 from __future__ import annotations
 
 import threading
 from typing import Callable
 
-import anthropic
-
+from ..llm import LLMClient
 from .types import Companion
 
-_OBSERVER_MODEL = 'claude-haiku-4-5-20251001'
 _MAX_RESPONSE_PREVIEW = 500
 _MAX_CHAT_HISTORY = 20  # Keep last N messages for companion conversation
 
@@ -63,8 +61,9 @@ _companion_chat = CompanionChat()
 def fire_companion_observer(
     last_assistant_msg: str,
     companion: Companion,
-    client: anthropic.Anthropic,
+    client: LLMClient,
     callback: Callable[[str], None],
+    model: str,
     user_msg: str = '',
 ) -> None:
     """Fire a background thread that generates a companion reaction.
@@ -108,8 +107,8 @@ def fire_companion_observer(
                 # Direct conversation — use chat history
                 _companion_chat.add_user(user_msg)
 
-                response = client.messages.create(
-                    model=_OBSERVER_MODEL,
+                response = client.create_message(
+                    model=model,
                     max_tokens=80,
                     system=(
                         f'{system_prompt}\n\n'
@@ -119,15 +118,15 @@ def fire_companion_observer(
                     ),
                     messages=_companion_chat.get_messages(),
                 )
-                reaction = response.content[0].text.strip()
+                reaction = _extract_text(response).strip()
                 if reaction:
                     _companion_chat.add_assistant(reaction)
                     callback(reaction)
             else:
                 # Normal mode — stateless one-liner
                 preview = last_assistant_msg[:_MAX_RESPONSE_PREVIEW]
-                response = client.messages.create(
-                    model=_OBSERVER_MODEL,
+                response = client.create_message(
+                    model=model,
                     max_tokens=60,
                     messages=[{
                         'role': 'user',
@@ -139,7 +138,7 @@ def fire_companion_observer(
                         ),
                     }],
                 )
-                reaction = response.content[0].text.strip()
+                reaction = _extract_text(response).strip()
                 if reaction:
                     callback(reaction)
         except Exception:
@@ -147,3 +146,13 @@ def fire_companion_observer(
 
     thread = threading.Thread(target=_run, daemon=True)
     thread.start()
+
+
+def _extract_text(response) -> str:
+    parts: list[str] = []
+    for block in response.content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            parts.append(block.get("text", ""))
+        elif hasattr(block, "text"):
+            parts.append(block.text)
+    return "".join(parts)

@@ -65,7 +65,7 @@ def _make_tool_then_text_response(tool_name, tool_input, tool_use_id, text):
 
 def test_engine_returns_text_events():
     engine = _make_engine()
-    with patch.object(engine._client.messages, "stream", return_value=_make_text_response("hello")):
+    with patch.object(engine._client, "stream_messages", return_value=_make_text_response("hello")):
         events = list(engine.submit("hi"))
     text_events = [e for e in events if e[0] == "text"]
     assert any("hello" in e[1] for e in text_events)
@@ -75,7 +75,7 @@ def test_engine_executes_tool_and_loops():
     engine = _make_engine()
     streams = _make_tool_then_text_response("Echo", {"message": "world"}, "tu_1", "done")
 
-    with patch.object(engine._client.messages, "stream", side_effect=streams):
+    with patch.object(engine._client, "stream_messages", side_effect=streams):
         events = list(engine.submit("use the echo tool"))
 
     tool_result_events = [e for e in events if e[0] == "tool_result"]
@@ -90,7 +90,7 @@ def test_engine_denied_tool_returns_error_result():
     streams = _make_tool_then_text_response("Echo", {"message": "hi"}, "tu_2", "ok")
 
     with patch.object(engine._permissions, "_prompt_user", return_value="deny"):
-        with patch.object(engine._client.messages, "stream", side_effect=streams):
+        with patch.object(engine._client, "stream_messages", side_effect=streams):
             events = list(engine.submit("echo hi"))
 
     tool_result_events = [e for e in events if e[0] == "tool_result"]
@@ -101,7 +101,7 @@ def test_engine_unknown_tool_returns_error():
     engine = _make_engine()
     streams = _make_tool_then_text_response("UnknownTool", {}, "tu_3", "done")
 
-    with patch.object(engine._client.messages, "stream", side_effect=streams):
+    with patch.object(engine._client, "stream_messages", side_effect=streams):
         events = list(engine.submit("use unknown"))
 
     tool_result_events = [e for e in events if e[0] == "tool_result"]
@@ -117,7 +117,7 @@ def test_engine_uses_model_specific_default_max_tokens():
         model="claude-sonnet-4",
     )
 
-    with patch.object(engine._client.messages, "stream", return_value=_make_text_response("hello")) as stream:
+    with patch.object(engine._client, "stream_messages", return_value=_make_text_response("hello")) as stream:
         list(engine.submit("hi"))
 
     assert stream.call_args.kwargs["model"] == "claude-sonnet-4"
@@ -128,7 +128,7 @@ def test_engine_normalizes_assistant_tool_use_blocks_before_retrying():
     engine = _make_engine()
     streams = _make_tool_then_text_response("Echo", {"message": "world"}, "tu_1", "done")
 
-    with patch.object(engine._client.messages, "stream", side_effect=streams) as stream:
+    with patch.object(engine._client, "stream_messages", side_effect=streams) as stream:
         list(engine.submit("use the echo tool"))
 
     second_messages = stream.call_args_list[1].kwargs["messages"]
@@ -148,7 +148,7 @@ def test_engine_normalizes_tool_result_blocks_before_follow_up_request():
     engine = _make_engine()
     streams = _make_tool_then_text_response("Echo", {"message": "world"}, "tu_1", "done")
 
-    with patch.object(engine._client.messages, "stream", side_effect=streams) as stream:
+    with patch.object(engine._client, "stream_messages", side_effect=streams) as stream:
         list(engine.submit("use the echo tool"))
 
     second_messages = stream.call_args_list[1].kwargs["messages"]

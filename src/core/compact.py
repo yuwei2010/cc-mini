@@ -6,8 +6,7 @@ Modelled after claude-code's ``src/services/compact/compact.ts``.
 from __future__ import annotations
 
 from typing import Any
-
-import anthropic
+from .llm import LLMClient
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -179,9 +178,10 @@ def _split_recent(messages: list[dict]) -> tuple[list[dict], list[dict]]:
 class CompactService:
     """Compress conversation context via API summarisation."""
 
-    def __init__(self, client: anthropic.Anthropic, model: str):
+    def __init__(self, client: LLMClient, model: str, effort: str | None = None):
         self._client = client
         self._model = model
+        self._effort = effort
 
     def compact(
         self,
@@ -216,16 +216,19 @@ class CompactService:
         # Ensure alternating roles
         cleaned = _fix_alternation(cleaned)
 
-        response = self._client.messages.create(
+        response = self._client.create_message(
             model=self._model,
             max_tokens=COMPACT_MAX_OUTPUT_TOKENS,
             system=COMPACT_SYSTEM,
             messages=cleaned,
+            effort=self._effort,
         )
 
         summary_text = ""
         for block in response.content:
-            if hasattr(block, "text"):
+            if isinstance(block, dict) and block.get("type") == "text":
+                summary_text += block.get("text", "")
+            elif hasattr(block, "text"):
                 summary_text += block.text
 
         if not summary_text.strip():

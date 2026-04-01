@@ -276,12 +276,22 @@ def _cmd_cost(ctx: CommandContext, args: str) -> None:
 def _cmd_model(ctx: CommandContext, args: str) -> None:
     from .config import resolve_model, default_max_tokens_for_model, DEFAULT_MODEL
 
+    provider = ctx.app_config.provider
+
     if args:
         ctx.engine.set_model(args.strip())
         actual = ctx.engine.get_model()
         ctx.console.print(
             f"[green]✓[/green] Set model to [bold]{actual}[/bold]  "
-            f"(max_tokens={default_max_tokens_for_model(actual)})")
+            f"(max_tokens={default_max_tokens_for_model(actual, provider=provider)})")
+        return
+
+    if provider != "anthropic":
+        current = ctx.engine.get_model()
+        ctx.console.print(
+            f"[dim]Current model: {current}[/dim]\n"
+            f"[dim]Use /model <name> to switch models for the {provider} provider.[/dim]"
+        )
         return
 
     from prompt_toolkit import Application
@@ -393,7 +403,7 @@ def _cmd_model(ctx: CommandContext, args: str) -> None:
     eff = effort_levels[effort_idx[0]]
     ctx.console.print(
         f"[green]✓[/green] Set model to [bold]{actual}[/bold]  "
-        f"(max_tokens={default_max_tokens_for_model(actual)}, effort={eff})"
+        f"(max_tokens={default_max_tokens_for_model(actual, provider=provider)}, effort={eff})"
     )
 
 
