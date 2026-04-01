@@ -42,14 +42,16 @@ _MODEL_PRICING: list[tuple[str, _PricingTier]] = [
     ("claude-3-7-sonnet", _TIER_3_15),
 ]
 
-_DEFAULT_TIER = _TIER_3_15  # fallback
+_DEFAULT_TIER = _TIER_3_15  # fallback for Claude-family / unknown legacy names
 
 
-def _tier_for_model(model: str) -> _PricingTier:
+def _tier_for_model(model: str) -> _PricingTier | None:
     model_lower = model.lower()
     for prefix, tier in _MODEL_PRICING:
         if prefix in model_lower:
             return tier
+    if model_lower.startswith(("gpt-", "o1", "o3", "o4")):
+        return None
     return _DEFAULT_TIER
 
 
@@ -65,6 +67,7 @@ class ModelUsage:
     cache_creation_input_tokens: int = 0
     cost_usd: float = 0.0
     api_duration_s: float = 0.0
+    pricing_known: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +128,8 @@ class CostTracker:
     def calculate_cost(model: str, usage: dict) -> float:
         """Return cost in USD for a single API call."""
         tier = _tier_for_model(model)
+        if tier is None:
+            return 0.0
         inp = usage.get("input_tokens", 0)
         out = usage.get("output_tokens", 0)
         cache_read = usage.get("cache_read_input_tokens", 0)
@@ -156,6 +161,8 @@ class CostTracker:
         mu.cache_creation_input_tokens += usage.get("cache_creation_input_tokens", 0)
         mu.cost_usd += cost
         mu.api_duration_s += api_duration_s
+        if _tier_for_model(model) is None:
+            mu.pricing_known = False
         return cost
 
     def add_lines_changed(self, added: int, removed: int) -> None:
@@ -169,8 +176,11 @@ class CostTracker:
             return "No API usage recorded."
 
         wall_s = time.monotonic() - self._wall_start
+        unknown_pricing = any(not mu.pricing_known for mu in self._model_usage.values())
         lines: list[str] = []
         lines.append(f"Total cost:            ${self._total_cost_usd:.2f}")
+        if unknown_pricing:
+            lines.append("Pricing note:          Some model pricing is unavailable; total excludes those calls")
         lines.append(f"Total duration (API):  {_fmt_duration(self._total_api_duration_s)}")
         lines.append(f"Total duration (wall): {_fmt_duration(wall_s)}")
         la = self._lines_added
@@ -194,6 +204,8 @@ class CostTracker:
             if mu.cache_creation_input_tokens:
                 parts.append(f"{_fmt_tokens(mu.cache_creation_input_tokens)} cache write")
             detail = ", ".join(parts)
+            if not mu.pricing_known:
+                detail += ", pricing unavailable"
             name_pad = model.rjust(max_name)
             lines.append(f"  {name_pad}:  {detail} (${mu.cost_usd:.4f})")
 

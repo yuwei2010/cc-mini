@@ -11,10 +11,10 @@ from __future__ import annotations
 
 import time
 
-import anthropic
 from rich.console import Console
 from rich.live import Live
 from rich.text import Text
+from ..llm import LLMClient
 
 from .companion import companion_user_id, get_companion, roll
 from .render import render_companion_card, render_hatch_animation, render_compact_status
@@ -25,15 +25,12 @@ from .storage import (
 )
 from .types import CompanionBones, CompanionSoul
 
-# Use cheapest/fastest model for soul generation to avoid burning user quota
-_BUDDY_MODEL = 'claude-haiku-4-5-20251001'
-
-
 def _generate_soul(
     bones: CompanionBones,
-    client: anthropic.Anthropic,
+    client: LLMClient,
+    model: str,
 ) -> CompanionSoul:
-    """Call Claude to generate a name and personality for the companion."""
+    """Call the configured LLM to generate a name and personality."""
     stats_desc = ', '.join(f'{k}={v}' for k, v in bones.stats.items())
     shiny_note = ' This is an extremely rare SHINY companion!' if bones.shiny else ''
 
@@ -49,13 +46,17 @@ def _generate_soul(
         f'PERSONALITY: <personality>'
     )
 
-    response = client.messages.create(
-        model=_BUDDY_MODEL,
+    response = client.create_message(
+        model=model,
         max_tokens=100,
         messages=[{'role': 'user', 'content': prompt}],
     )
 
-    text = response.content[0].text.strip()
+    text = ""
+    for block in response.content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            text += block.get("text", "")
+    text = text.strip()
     name = 'Buddy'
     personality = f'A mysterious {bones.species}.'
 
@@ -69,7 +70,7 @@ def _generate_soul(
     return CompanionSoul(name=name, personality=personality)
 
 
-def _hatch(client: anthropic.Anthropic, console: Console) -> None:
+def _hatch(client: LLMClient, console: Console, model: str) -> None:
     """Hatch a new companion: generate bones, call API for soul, save, animate."""
     user_id = companion_user_id()
     r = roll(user_id)
@@ -78,7 +79,7 @@ def _hatch(client: anthropic.Anthropic, console: Console) -> None:
     console.print(f'\n[dim]Hatching your companion...[/dim]')
 
     try:
-        soul = _generate_soul(bones, client)
+        soul = _generate_soul(bones, client, model)
     except Exception as e:
         console.print(f'[red]Failed to generate companion soul: {e}[/red]')
         # Fallback soul
@@ -144,8 +145,9 @@ def _pet_animation(console: Console) -> None:
 
 def handle_buddy_command(
     args: str,
-    client: anthropic.Anthropic,
+    client: LLMClient,
     console: Console,
+    model: str,
 ) -> None:
     """Handle /buddy commands."""
     subcmd = args.strip().lower()
@@ -156,7 +158,7 @@ def handle_buddy_command(
         if companion:
             render_companion_card(companion, console)
         else:
-            _hatch(client, console)
+            _hatch(client, console, model)
 
     elif subcmd == 'pet':
         companion = get_companion()

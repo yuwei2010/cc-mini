@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from core.config import (
+    DEFAULT_PROVIDER,
     DEFAULT_MODEL,
     default_max_tokens_for_model,
     load_app_config,
@@ -17,10 +18,17 @@ def _args(**overrides):
         "print": False,
         "auto_approve": False,
         "config": None,
+        "provider": None,
         "api_key": None,
         "base_url": None,
         "model": None,
         "max_tokens": None,
+        "effort": None,
+        "buddy_model": None,
+        "memory_dir": None,
+        "no_auto_dream": False,
+        "dream_interval": None,
+        "dream_min_sessions": None,
     }
     values.update(overrides)
     return Namespace(**values)
@@ -55,6 +63,7 @@ def test_load_app_config_reads_anthropic_section(tmp_path: Path, monkeypatch: py
 
     config = load_app_config(_args(config=str(config_path)))
 
+    assert config.provider == DEFAULT_PROVIDER
     assert config.api_key == "config-key"
     assert config.base_url == "https://example.test"
     assert config.model == "claude-3-7-sonnet"
@@ -99,6 +108,7 @@ def test_load_app_config_uses_defaults_when_nothing_is_set(monkeypatch: pytest.M
 
     config = load_app_config(_args())
 
+    assert config.provider == DEFAULT_PROVIDER
     assert config.api_key is None
     assert config.base_url is None
     assert config.model == DEFAULT_MODEL
@@ -111,3 +121,48 @@ def test_load_app_config_rejects_invalid_max_tokens(tmp_path: Path):
 
     with pytest.raises(ValueError, match="Invalid max_tokens"):
         load_app_config(_args(config=str(config_path)))
+
+
+def test_load_app_config_reads_openai_section(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("CC_MINI_PROVIDER", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+
+    config_path = tmp_path / "cc-mini.toml"
+    config_path.write_text(
+        'provider = "openai"\n'
+        '[openai]\n'
+        'api_key = "openai-key"\n'
+        'base_url = "https://openai.test"\n'
+        'model = "gpt-4.1-mini"\n'
+        'max_tokens = 4096\n'
+        'effort = "low"\n'
+        'buddy_model = "gpt-4.1-nano"\n',
+        encoding="utf-8",
+    )
+
+    config = load_app_config(_args(config=str(config_path)))
+
+    assert config.provider == "openai"
+    assert config.api_key == "openai-key"
+    assert config.base_url == "https://openai.test"
+    assert config.model == "gpt-4.1-mini"
+    assert config.max_tokens == 4096
+    assert config.effort == "low"
+    assert config.buddy_model == "gpt-4.1-nano"
+
+
+def test_openai_env_wins_when_provider_is_openai(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("CC_MINI_PROVIDER", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-env-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://openai.env")
+    monkeypatch.setenv("CC_MINI_MODEL", "gpt-4.1")
+    monkeypatch.setenv("CC_MINI_BUDDY_MODEL", "gpt-4.1-mini")
+
+    config = load_app_config(_args())
+
+    assert config.provider == "openai"
+    assert config.api_key == "openai-env-key"
+    assert config.base_url == "https://openai.env"
+    assert config.model == "gpt-4.1"
+    assert config.buddy_model == "gpt-4.1-mini"

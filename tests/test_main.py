@@ -70,7 +70,7 @@ def test_run_query_prints_text(capsys):
     from core.main import run_query
 
     engine = _make_engine()
-    with patch.object(engine._client.messages, "stream", return_value=_make_text_stream("hello world")):
+    with patch.object(engine._client, "stream_messages", return_value=_make_text_stream("hello world")):
         run_query(engine, "hi", print_mode=True)
 
     captured = capsys.readouterr()
@@ -100,7 +100,7 @@ def test_run_query_handles_tool_call_event():
 
     second_stream = _make_text_stream("done")
 
-    with patch.object(engine._client.messages, "stream", side_effect=[first_stream, second_stream]):
+    with patch.object(engine._client, "stream_messages", side_effect=[first_stream, second_stream]):
         run_query(engine, "use tool", print_mode=True)
 
 
@@ -114,6 +114,6 @@ def test_run_query_handles_keyboard_interrupt():
     def raise_interrupt(*a, **kw):
         raise KeyboardInterrupt()
 
-    with patch.object(engine._client.messages, "stream", side_effect=raise_interrupt):
+    with patch.object(engine._client, "stream_messages", side_effect=raise_interrupt):
         run_query(engine, "hi", print_mode=True)
     # Should not propagate the exception

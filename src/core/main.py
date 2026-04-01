@@ -427,11 +427,17 @@ def main() -> None:
     parser.add_argument("--auto-approve", action="store_true",
                         help="Auto-approve all tool permissions (dangerous)")
     parser.add_argument("--config", help="Path to a TOML config file")
-    parser.add_argument("--api-key", help="Anthropic API key")
-    parser.add_argument("--base-url", help="Anthropic-compatible API base URL")
+    parser.add_argument("--provider", choices=("anthropic", "openai"),
+                        help="API provider / wire format")
+    parser.add_argument("--api-key", help="API key for the selected provider")
+    parser.add_argument("--base-url", help="Custom API base URL for the selected provider")
     parser.add_argument("--model", help="Model name, e.g. claude-sonnet-4")
     parser.add_argument("--max-tokens", type=int,
                         help="Maximum output tokens for each model response")
+    parser.add_argument("--effort", choices=("low", "medium", "high"),
+                        help="Optional reasoning effort for supported OpenAI models")
+    parser.add_argument("--buddy-model",
+                        help="Override the model used by buddy / companion side-features")
     parser.add_argument("--resume", metavar="SESSION",
                         help="Resume a previous session (id or index)")
     parser.add_argument("--memory-dir", help="Override memory directory path")
@@ -487,14 +493,20 @@ def main() -> None:
         tools=tools,
         system_prompt=system_prompt,
         permission_checker=permissions,
+        provider=app_config.provider,
         api_key=app_config.api_key,
         base_url=app_config.base_url,
         model=app_config.model,
         max_tokens=app_config.max_tokens,
+        effort=app_config.effort,
         session_store=session_store,
         cost_tracker=cost_tracker,
     )
-    compact_service = CompactService(client=engine._client, model=app_config.model)
+    compact_service = CompactService(
+        client=engine._client,
+        model=app_config.model,
+        effort=app_config.effort,
+    )
 
     # Handle --resume
     if args.resume and session_store is not None:
@@ -531,7 +543,10 @@ def main() -> None:
         return
 
     # Interactive REPL
-    config_note = f"[dim]{app_config.model} · max_tokens={app_config.max_tokens}[/dim]"
+    config_note = (
+        f"[dim]{app_config.provider}:{app_config.model} · "
+        f"max_tokens={app_config.max_tokens}[/dim]"
+    )
     session_note = f"[dim]session {session_store.session_id[:8]}[/dim]" if session_store else ""
     console.print("[bold cyan]cc-mini[/bold cyan]  "
                   f"{config_note}  {session_note}")
@@ -648,7 +663,12 @@ def main() -> None:
             # /buddy is handled separately (companion pet)
             if cmd_name == "buddy":
                 from .buddy.commands import handle_buddy_command
-                handle_buddy_command(cmd_args, engine._client, console)
+                handle_buddy_command(
+                    cmd_args,
+                    engine._client,
+                    console,
+                    app_config.buddy_model or app_config.model,
+                )
                 # Refresh animator in case companion was just hatched
                 try:
                     from .buddy.companion import get_companion
@@ -705,6 +725,7 @@ def main() -> None:
                         reply_event.set()
                     fire_companion_observer(
                         '', comp, engine._client, _direct_reply,
+                        model=app_config.buddy_model or app_config.model,
                         user_msg=user_input,
                     )
                     reply_event.wait(timeout=10)
@@ -742,6 +763,7 @@ def main() -> None:
                         if assistant_text.strip():
                             fire_companion_observer(
                                 assistant_text, comp, engine._client, _set_reaction,
+                                model=app_config.buddy_model or app_config.model,
                                 user_msg=user_input,
                             )
         except Exception:
