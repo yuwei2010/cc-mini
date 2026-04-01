@@ -214,6 +214,10 @@ def handle_buddy_command(
         save_companion_muted(False)
         console.print('[dim]Companion reactions unmuted.[/dim]')
 
+    elif subcmd == 'ia':
+        from .poke_game import start_game
+        start_game(client, console, model)
+
     elif subcmd == 'new':
         _hatch_new(client, console, model)
 
@@ -223,7 +227,6 @@ def handle_buddy_command(
         render_companion_list(companions, active, console)
 
     elif subcmd.startswith('select'):
-        # Parse: /buddy select N (1-based)
         parts = subcmd.split()
         if len(parts) != 2 or not parts[1].isdigit():
             console.print('[dim]Usage: /buddy select <number> (e.g. /buddy select 2)[/dim]')
@@ -241,5 +244,6 @@ def handle_buddy_command(
 
     else:
         console.print(
-            '[dim]Usage: /buddy [pet|stats|new|list|select N|mute|unmute][/dim]'
+            '[dim]Usage: /buddy [pet|stats|new|list|select N|mute|unmute|ia][/dim]'
+          )
         )
