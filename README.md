@@ -5,10 +5,9 @@
 **Ultra light Harness scaffolding for a AI Agent**
 
 Compatible with **Anthropic** and **OpenAI** APIs &nbsp;·&nbsp; **Agentic** &nbsp;·&nbsp; **Session Persistent** &nbsp;·&nbsp; **Built to Extend**
-
 <br>
 
-> ### The entire **core** is `~5000 lines of Python` — that's it.
+**The entire core is `~5000 lines of Python` — that's it.**
 
 </div>
 
