@@ -1,8 +1,16 @@
+<div align="center">
+
 # cc-mini
 
-A lightweight Python reimplementation of [Claude Code](https://claude.ai/code) — a terminal-based AI coding assistant powered by the Anthropic API. Runs an agentic tool loop, supports session persistence, and is built for extensibility.
+**Ultra light Harness scaffolding for a AI Agent**
 
-The entire implementation is **~5000 lines of Python**.
+Compatible with **Anthropic** and **OpenAI** APIs &nbsp;·&nbsp; **Agentic** &nbsp;·&nbsp; **Session Persistent** &nbsp;·&nbsp; **Built to Extend**
+
+<br>
+
+> ### The entire **core** is `~5000 lines of Python` — that's it.
+
+</div>
 
 ---
 
