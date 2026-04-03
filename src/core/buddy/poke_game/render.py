@@ -1,581 +1,391 @@
-"""Rich terminal rendering for Idle Adventure.
+"""Idle Adventure — fixed full-screen TUI rendering.
 
-Persistent HUD + scrollable message area + animations.
+Four screen states:
+  MAIN_MENU  — arrow key menu (start adventure / badges / gacha)
+  ADVENTURE  — HUD + auto-scrolling log
+  BADGES     — badge collection overview
+  GACHA      — single draw / 10-pull with guaranteed rare
 """
 from __future__ import annotations
 
-import os
-import random
-import shutil
-import sys
-import time
-
-from rich.columns import Columns
-from rich.console import Console
+from rich import box
+from rich.align import Align
+from rich.layout import Layout
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
-from rich import box
 
-from .types import (
-    Badge, GameSession, Item, Skill, NPC,
-    BADGE_COLORS, GAME_STAT_NAMES,
-)
+from ..sprites import render_sprite, sprite_frame_count
+from ..types import CompanionBones
 from .badges import ALL_BADGES, badge_progress
-from .world import LOCATIONS, REGIONS, REGION_ORDER
+from .types import BADGE_COLORS, TICKET_COST, GameSession
+
+# ---------------------------------------------------------------------------
+# Shared frame counter for sprite animation
+# ---------------------------------------------------------------------------
+_frame = 0
+
+
+def tick_frame() -> None:
+    global _frame
+    _frame += 1
 
 
 # ---------------------------------------------------------------------------
-# Sprite states — determines which frame and expression
+# Markup helper — Text.append() does NOT parse [bold] etc.
 # ---------------------------------------------------------------------------
 
-SPRITE_IDLE = "idle"
-SPRITE_EXPLORE = "explore"
-SPRITE_BATTLE = "battle"
-SPRITE_REST = "rest"
-SPRITE_TALK = "talk"
-SPRITE_HURT = "hurt"
-
-# Tick counter for idle animation (incremented each redraw)
-_idle_tick = 0
-
-
-def _get_sprite_lines(session: GameSession, state: str = SPRITE_IDLE) -> list[str]:
-    """Get buddy sprite lines with state-appropriate frame."""
-    global _idle_tick
-    _idle_tick += 1
-
-    try:
-        from ..sprites import render_sprite
-        from ..types import CompanionBones
-        bones = CompanionBones(
-            rarity="common",
-            species=session.companion_species,
-            eye=session.companion_eye,
-            hat=session.companion_hat,
-            shiny=False,
-        )
-
-        if state == SPRITE_IDLE:
-            # Cycle through frames slowly
-            frame = (_idle_tick // 2) % 3
-        elif state == SPRITE_EXPLORE:
-            frame = (_idle_tick % 3)  # fast cycling
-        elif state == SPRITE_BATTLE:
-            frame = (_idle_tick % 2)  # alternating attack frames
-        elif state == SPRITE_REST:
-            frame = 0  # static, eyes closed handled below
-        elif state == SPRITE_TALK:
-            frame = 1  # engaged frame
-        else:
-            frame = 0
-
-        lines = render_sprite(bones, frame=frame)
-
-        # Modify sprite based on state
-        if state == SPRITE_REST:
-            # Replace eyes with - for sleeping
-            lines = [line.replace(session.companion_eye, "-") for line in lines]
-        elif state == SPRITE_BATTLE:
-            # Add battle effect
-            if _idle_tick % 2 == 0:
-                lines[-1] = lines[-1].rstrip() + "  *"
-            else:
-                lines[-1] = lines[-1].rstrip() + " **"
-        elif state == SPRITE_HURT:
-            lines = [line.replace(session.companion_eye, "x") for line in lines]
-
-        return lines
-    except Exception:
-        return [
-            "  .---.",
-            f"  |{session.companion_eye} {session.companion_eye}|",
-            "  | _ |",
-            "  '---'",
-        ]
+def _m(t: Text, markup: str) -> None:
+    """Append a Rich-markup string to a Text object (parsed)."""
+    t.append_text(Text.from_markup(markup))
 
 
 # ---------------------------------------------------------------------------
-# HUD
+# Sprite helpers
 # ---------------------------------------------------------------------------
 
-def _stat_bar(value: int, max_val: int, width: int = 12) -> str:
-    filled = min(width, max(0, value * width // max(max_val, 1)))
-    return "\u2588" * filled + "\u2591" * (width - filled)
+def _get_sprite_lines(session: GameSession) -> list[str]:
+    bones = CompanionBones(
+        rarity="common",
+        species=session.companion_species,
+        eye=session.companion_eye,
+        hat=session.companion_hat,
+        shiny=False,
+    )
+    count = sprite_frame_count(session.companion_species)
+    return render_sprite(bones, _frame % count)
 
 
-def render_hud(session: GameSession, console: Console,
-               sprite_state: str = SPRITE_IDLE) -> None:
-    """Render the persistent HUD panel."""
-    sprite_lines = _get_sprite_lines(session, sprite_state)
+# ---------------------------------------------------------------------------
+# Stat bar helper (returns plain string, no markup)
+# ---------------------------------------------------------------------------
 
-    hp = session.stats.get("HP", 0)
-    hp_color = "red" if hp < 30 else ("yellow" if hp < 60 else "green")
-    stats_text = Text()
-    stats_text.append(f" HP  {_stat_bar(hp, 200)} {hp}\n", style=hp_color)
-    stats_text.append(f" ATK {_stat_bar(session.stats.get('ATK', 0), 60)} {session.stats.get('ATK', 0)}\n", style="cyan")
-    stats_text.append(f" DEF {_stat_bar(session.stats.get('DEF', 0), 60)} {session.stats.get('DEF', 0)}\n", style="cyan")
-    stats_text.append(f" SPD {_stat_bar(session.stats.get('SPD', 0), 60)} {session.stats.get('SPD', 0)}\n", style="cyan")
-    stats_text.append(f" LCK {_stat_bar(session.stats.get('LCK', 0), 60)} {session.stats.get('LCK', 0)}\n", style="cyan")
+def _stat_bar(value: int, maximum: int, width: int = 10) -> str:
+    ratio = min(1.0, value / max(1, maximum))
+    filled = int(ratio * width)
+    return "█" * filled + "░" * (width - filled)
 
-    loc_name = session.location.name if session.location else "???"
-    region = session.location.region if session.location else "???"
+
+# ---------------------------------------------------------------------------
+# MAIN MENU
+# ---------------------------------------------------------------------------
+
+MENU_ITEMS = ["开始新的冒险", "查看已有奖章", "开始抽奖"]
+
+_STORY = (
+    "很久以前，世界树「源树」\n"
+    "维系着六块大陆的平衡。\n"
+    "\n"
+    "一场「大断裂」灾难降临，\n"
+    "源树核心碎为 30 枚徽章，\n"
+    "散落在六块大陆的角落。\n"
+    "\n"
+    "怪物从虚空裂隙中涌出，\n"
+    "世界陷入了混沌与黑暗。\n"
+    "\n"
+    "传说——\n"
+    "集齐全部徽章，\n"
+    "便能唤醒源树，\n"
+    "让光重回大地。\n"
+    "\n"
+    "冒险可获得奖券，\n"
+    "奖券可以抽取徽章碎片。\n"
+    "你的伙伴即将踏上旅途……"
+)
+
+
+def render_main_menu(session: GameSession, cursor: int) -> Panel:
+    """Render the main menu: left=title, center=sprite+menu, right=story. All in one box."""
+    lines = _get_sprite_lines(session)
+    sprite_text = "\n".join(lines)
     owned, total = badge_progress(session)
 
-    from .world import get_location_npcs
-    local_npcs = get_location_npcs(loc_name)
-    npc_str = ", ".join(n.name for n in local_npcs) if local_npcs else "-"
+    # --- Left: title (horizontal, two lines, centered) ---
+    left = Text(justify="center")
+    left.append("\n\n\n\n")
+    left.append("I D L E\n", style="bold cyan")
+    left.append("A D V E N T U R E\n", style="bold cyan")
+    left.append("\n")
+    left.append("✦ ✦ ✦\n", style="dim cyan")
 
-    info_text = Text()
-    info_text.append(f" \u2302 {loc_name}\n", style="bold green")
-    info_text.append(f"   {region}\n", style="dim")
-    info_text.append(f" \u2606 徽章 {owned}/{total}\n")
-    info_text.append(f" \u2726 券 {session.tickets}\n", style="yellow")
-    info_text.append(f" \u263a NPC {npc_str}\n", style="dim")
+    # --- Center: sprite + menu + status ---
+    center = Text()
+    center.append("\n")
+    center.append(sprite_text + "\n\n", style="bold")
+    for i, item in enumerate(MENU_ITEMS):
+        if i == cursor:
+            center.append(f" ▶  {item}\n", style="bold cyan")
+        else:
+            center.append(f"    {item}\n", style="dim")
+    center.append(f"\n 奖券: {session.tickets}  徽章: {owned}/{total}\n", style="dim")
+    center.append("\n ↑↓选择 Enter确认 Q退出\n", style="dim")
 
-    sprite_text = Text()
-    for line in sprite_lines:
-        sprite_text.append(f"  {line}\n")
+    # --- Right: story ---
+    right = Text()
+    right.append("\n")
+    for line in _STORY.split("\n"):
+        right.append(line + "\n", style="dim italic")
 
-    cols = Columns([sprite_text, stats_text, info_text], padding=(0, 2))
-    title = f" {session.companion_name} the {session.companion_species} "
-    mood_icon = "\u2665" if session.mood > 60 else ("\u223c" if session.mood > 30 else "\u2639")
-    subtitle = f" 心情:{mood_icon}{session.mood} | 回合:{session.turn_count} "
+    # 3 columns via Table (doesn't auto-expand height like Layout)
+    inner = Table(show_header=False, box=None, expand=True, padding=(0, 2))
+    inner.add_column(ratio=30)
+    inner.add_column(ratio=40)
+    inner.add_column(ratio=30)
+    inner.add_row(Align.center(left, vertical="middle"), Align.center(center), right)
 
-    console.print(Panel(
-        cols,
-        title=f"[bold]{title}[/bold]",
-        subtitle=f"[dim]{subtitle}[/dim]",
-        border_style="cyan",
-        box=box.ROUNDED,
-    ))
-
-
-# ---------------------------------------------------------------------------
-# Message box — scrollable area below HUD
-# ---------------------------------------------------------------------------
-
-class MessageBuffer:
-    """Circular buffer of game messages with timestamps and action separators."""
-
-    def __init__(self, max_size: int = 200):
-        self._messages: list[str] = []
-        self._max_size = max_size
-
-    def add(self, text: str) -> None:
-        """Add a plain message line (no separator)."""
-        ts = time.strftime("%H:%M:%S")
-        self._messages.append(f"[dim]{ts}[/dim] {text}")
-        if len(self._messages) > self._max_size:
-            self._messages = self._messages[-self._max_size:]
-
-    def add_action(self, action: str, detail: str = "") -> None:
-        """Add an action separator line with timestamp."""
-        ts = time.strftime("%H:%M:%S")
-        label = f"{action} {detail}".strip()
-        # Build separator: ─── 探索 林间小径 ───────────
-        sep = f"\u2500\u2500\u2500 {label} "
-        sep += "\u2500" * max(1, 40 - len(sep))
-        self._messages.append(f"\n[bold cyan]{ts}[/bold cyan] [dim]{sep}[/dim]")
-        if len(self._messages) > self._max_size:
-            self._messages = self._messages[-self._max_size:]
-
-    def get_recent(self, n: int = 15) -> list[str]:
-        return self._messages[-n:]
-
-    def render(self, console: Console, max_lines: int = 0) -> None:
-        """Print recent messages as a panel."""
-        term_h = shutil.get_terminal_size((80, 24)).lines
-        available = max_lines or max(5, term_h - 14)
-        recent = self.get_recent(available)
-        if not recent:
-            console.print(Panel("[dim]等待冒险开始...[/dim]",
-                                border_style="dim", box=box.ROUNDED))
-            return
-        content = "\n".join(recent)
-        console.print(Panel(content, border_style="dim", box=box.ROUNDED))
-
-
-# Global message buffer instance
-message_buffer = MessageBuffer()
-
-
-def msg(text: str) -> None:
-    """Add a message to the scrollable buffer."""
-    message_buffer.add(text)
-
-
-def msg_action(action: str, detail: str = "") -> None:
-    """Add an action separator to the message buffer."""
-    message_buffer.add_action(action, detail)
-
-
-def clear_and_redraw(session: GameSession, console: Console,
-                      sprite_state: str = SPRITE_IDLE) -> None:
-    """Clear screen, draw HUD, then message area."""
-    # Use ANSI escape codes instead of os.system("clear") for compatibility
-    sys.stdout.write("\033[2J\033[H")
-    sys.stdout.flush()
-    render_hud(session, console, sprite_state)
-    message_buffer.render(console)
-
-
-# ---------------------------------------------------------------------------
-# Banner
-# ---------------------------------------------------------------------------
-
-_BANNER = r"""
-  ___ ____  _     _____
- |_ _|  _ \| |   | ____|
-  | || | | | |   |  _|
-  | || |_| | |___| |___
- |___|____/|_____|_____|
-     _       ____  _     _______ _   _ _____ _   _ ____  _____
-    / \     |  _ \| |   | ____\ | \ | |_   _| | | |  _ \| ____|
-   / _ \    | | | | |   |  _|  |  \| | | | | | | | |_) |  _|
-  / ___ \ _ | |_| | |___| |___ | |\  | | | | |_| |  _ <| |___
- /_/   \_(_)|____/|_____|_____||_| \_| |_|  \___/|_| \_\_____|
-"""
-
-
-def render_game_banner(name: str, species: str, console: Console) -> None:
-    console.print(Panel(
-        f"[bold cyan]{_BANNER}[/bold cyan]\n"
-        f"  [bold]{name}[/bold] the [italic]{species}[/italic] 开始了冒险！",
+    return Panel(
+        inner,
         border_style="cyan",
         box=box.DOUBLE,
-    ))
-
-
-# ---------------------------------------------------------------------------
-# Explore animation (writes to message buffer)
-# ---------------------------------------------------------------------------
-
-_EXPLORE_FRAMES = [
-    "{name} 正在四处张望 @_@",
-    "{name} 翻开了一块石头...",
-    "{name} 钻进了灌木丛...",
-    "{name} 发现了什么痕迹!",
-    "{name} 小心翼翼地前进...",
-]
-
-
-def render_explore_animation(name: str, console: Console) -> None:
-    frames = [f.format(name=name) for f in _EXPLORE_FRAMES]
-    for frame in random.sample(frames, min(3, len(frames))):
-        console.print(f"  [dim]{frame}[/dim]")
-        time.sleep(0.4)
-
-
-# ---------------------------------------------------------------------------
-# Travel animation
-# ---------------------------------------------------------------------------
-
-def render_travel_animation(name: str, dest: str, console: Console) -> None:
-    steps = ["\u00b7", "\u00b7\u00b7", "\u00b7\u00b7\u00b7", "\u00b7\u00b7\u00b7\u00b7"]
-    for i, step in enumerate(steps):
-        pad = "  " * (i + 1)
-        console.print(f"\r  {name} {pad}{step} \u279c {dest}", end="")
-        sys.stdout.flush()
-        time.sleep(0.25)
-    console.print()
-
-
-# ---------------------------------------------------------------------------
-# Talk animation
-# ---------------------------------------------------------------------------
-
-_BUDDY_FACES = ["(^_^)", "(>_<)", "(o_o)", "(-_-)", "(*_*)", "(~_~)"]
-
-
-def render_talk_enter(name: str, console: Console) -> None:
-    face = random.choice(_BUDDY_FACES)
-    console.print(f"  {name}  {face}  !")
-
-
-def render_talk_exit(name: str, console: Console) -> None:
-    console.print(f"  {name} (^_^)/ ~~")
-
-
-# ---------------------------------------------------------------------------
-# Use item animation
-# ---------------------------------------------------------------------------
-
-def render_use_item_animation(item_name: str, effect: str,
-                                console: Console) -> None:
-    sparkles = ["\u2728", "\u2728\u2728", "\u2728\u2728\u2728"]
-    for s in sparkles:
-        console.print(f"\r  {s} 使用 {item_name}...", end="")
-        sys.stdout.flush()
-        time.sleep(0.2)
-    console.print(f"\r  \u2728 使用 {item_name}... [bold green]{effect}[/bold green]!")
-
-
-# ---------------------------------------------------------------------------
-# Rest animation
-# ---------------------------------------------------------------------------
-
-def render_rest_animation(name: str, hp_gain: int, console: Console) -> None:
-    zzz = ""
-    for _ in range(3):
-        zzz += "z"
-        console.print(f"\r  {name} {zzz.upper()}...", end="")
-        sys.stdout.flush()
-        time.sleep(0.3)
-    console.print(f"\r  {name} ZZZ... [green]HP+{hp_gain}[/green]!")
-
-
-# ---------------------------------------------------------------------------
-# Look animation
-# ---------------------------------------------------------------------------
-
-def render_look_animation(name: str, console: Console) -> None:
-    eyes = ["\u25c9 \u00b7", "\u00b7 \u25c9", "\u25c9 \u25c9"]
-    for e in eyes:
-        console.print(f"\r  {name} [{e}]", end="")
-        sys.stdout.flush()
-        time.sleep(0.15)
-    console.print()
-
-
-# ---------------------------------------------------------------------------
-# Location / Narration (these now also push to message buffer)
-# ---------------------------------------------------------------------------
-
-def render_location(session: GameSession, console: Console) -> None:
-    loc = session.location
-    if not loc:
-        return
-    from .world import get_location_npcs
-    connections = ", ".join(loc.connections)
-    local_npcs = get_location_npcs(loc.name)
-    npcs = ", ".join(n.name for n in local_npcs) if local_npcs else ""
-
-    content = f"{loc.description}"
-    content += f"\n可前往: {connections}"
-    if npcs:
-        content += f"  |  NPC: {npcs}"
-    console.print(Panel(content, title=f"[bold]{loc.name}[/bold]", border_style="green"))
-
-
-def render_narration(text: str, console: Console) -> None:
-    console.print(Panel(text, border_style="blue", box=box.ROUNDED))
-    msg(text)
-
-
-# ---------------------------------------------------------------------------
-# Stats / Inventory / Skills / Badges / Map (info commands)
-# ---------------------------------------------------------------------------
-
-def render_game_stats(session: GameSession, console: Console) -> None:
-    table = Table(title=f"{session.companion_name} 的属性", box=box.SIMPLE_HEAVY)
-    table.add_column("属性", style="bold")
-    table.add_column("值", justify="right")
-    table.add_column("", width=20)
-    for stat in GAME_STAT_NAMES:
-        val = session.stats.get(stat, 0)
-        if stat == "HP":
-            bar_len = min(20, max(0, val * 20 // 200))
-            clr = "red" if val < 30 else ("yellow" if val < 60 else "green")
-            bar = f"[{clr}]" + "\u2588" * bar_len + "\u2591" * (20 - bar_len) + f"[/{clr}]"
-            table.add_row(stat, f"[{clr}]{val}[/{clr}]", bar)
-        else:
-            bar_len = min(20, val * 20 // 60)
-            bar = "[cyan]" + "\u2588" * bar_len + "\u2591" * (20 - bar_len) + "[/cyan]"
-            table.add_row(stat, str(val), bar)
-    table.add_row("", "", "")
-    table.add_row("[bold]心情[/bold]", str(session.mood), "")
-    table.add_row("[bold]抽奖券[/bold]", str(session.tickets), "")
-    console.print(table)
-
-
-def render_inventory(items: list[Item], console: Console) -> None:
-    if not items:
-        console.print("[dim]背包空空如也。[/dim]")
-        return
-    table = Table(title="\U0001f392 背包", box=box.SIMPLE)
-    table.add_column("#", width=3)
-    table.add_column("物品", style="bold")
-    table.add_column("稀有度")
-    table.add_column("效果", style="cyan")
-    rarity_colors = {"common": "dim", "uncommon": "green", "rare": "blue",
-                     "epic": "magenta", "legendary": "yellow"}
-    for i, item in enumerate(items, 1):
-        c = rarity_colors.get(item.rarity, "dim")
-        table.add_row(str(i), item.name, f"[{c}]{item.rarity}[/{c}]", item.effect)
-    console.print(table)
-
-
-def render_skills(skills: list[Skill], console: Console) -> None:
-    if not skills:
-        console.print("[dim]还没有学会任何技能。[/dim]")
-        return
-    table = Table(title="\u2694 技能", box=box.SIMPLE)
-    table.add_column("#", width=3)
-    table.add_column("技能", style="bold")
-    table.add_column("威力", justify="right")
-    table.add_column("元素")
-    elem_colors = {"fire": "red", "water": "blue", "earth": "yellow",
-                   "wind": "green", "shadow": "magenta", "light": "white"}
-    for i, skill in enumerate(skills, 1):
-        c = elem_colors.get(skill.element, "dim")
-        table.add_row(str(i), skill.name, str(skill.power), f"[{c}]{skill.element}[/{c}]")
-    console.print(table)
-
-
-def render_badges(badges: list[Badge], console: Console) -> None:
-    owned_ids = {b.badge_id for b in badges}
-    owned, total = len(owned_ids), len(ALL_BADGES)
-    console.print(f"\n[bold]\u2606 徽章 {owned}/{total}[/bold]\n")
-    for tier, label in [("green", "\u25cf 普通"), ("purple", "\u25c6 珍贵"),
-                         ("red", "\u2666 稀有"), ("gold", "\u2605 传说")]:
-        color = BADGE_COLORS.get(tier, "dim")
-        parts = []
-        for bid, badge in ALL_BADGES.items():
-            if badge.tier != tier:
-                continue
-            if bid in owned_ids:
-                parts.append(f"[{color} bold]\u25c9 {badge.name}[/{color} bold]")
-            else:
-                parts.append(f"[dim]\u25cb ???[/dim]")
-        console.print(f"  [{color}][{label}][/{color}] {' '.join(parts)}")
-    console.print()
-
-
-def render_map(session: GameSession, console: Console) -> None:
-    cur = session.location.name if session.location else ""
-
-    def _n(name: str) -> str:
-        if name == cur:
-            return f"[bold green on dark_green] {name} [/bold green on dark_green]"
-        return f"[dim]{name}[/dim]"
-
-    L = _n  # shorthand
-    map_text = (
-        f"  [bold yellow]-- 幽暗森林 --[/bold yellow]                    [bold blue]-- 水晶洞穴 --[/bold blue]\n"
-        f"\n"
-        f"  {L('林间小径')} ─┬─ {L('古树之心')}        {L('入口大厅')} ─┬─ {L('矿脉通道')}\n"
-        f"              │         │                  │              │\n"
-        f"        {L('蘑菇洼地')}    {L('精灵泉')}        {L('地底湖')} ─┴─ {L('晶体殿堂')}\n"
-        f"              │              ↑                  │\n"
-        f"              └──────────────┼──────────────────┤\n"
-        f"                             │                  │\n"
-        f"  [bold red]-- 风暴山脉 --[/bold red]                    [bold cyan]-- 深海遗迹 --[/bold cyan]\n"
-        f"\n"
-        f"  {L('山脚营地')}                            {L('沉船残骸')}\n"
-        f"        │                                    │\n"
-        f"  {L('悬崖小径')}                            {L('珊瑚迷宫')}\n"
-        f"        │                                    │\n"
-        f"  {L('云端平台')}                            {L('海神祭坛')}\n"
-        f"        │                                    │\n"
-        f"  {L('山顶神殿')}                            {L('深渊裂隙')}\n"
-        f"                                             │\n"
-        f"                                   ┌─────────┘\n"
-        f"                                   │\n"
-        f"  [bold magenta]-- 机械废墟 --[/bold magenta]                    [bold yellow]-- 星光圣殿 --[/bold yellow]\n"
-        f"\n"
-        f"  {L('废弃工厂')} ─── {L('数据中心')}        {L('前厅')} ─┬─ {L('星图室')}\n"
-        f"                         │                │         │\n"
-        f"                   {L('能量核心')}        {L('命运之池')}    {L('王座大厅')}\n"
-        f"                         │                │              │\n"
-        f"                   {L('控制室')} ─────── ┘   └──────────┘\n"
     )
 
-    console.print(Panel(map_text, title="[bold]世界地图[/bold]", border_style="cyan"))
+
+# ---------------------------------------------------------------------------
+# Badge logo rendering (compact, colored by tier)
+#
+# Tier borders:   Gold ⟪N⟫   Red ⟨N⟩   Purple [N]   Green (N)
+# Only owned badges are shown. 4 rows, top = most rare.
+# ---------------------------------------------------------------------------
+
+# badge_id format: "green_01" .. "gold_02" → extract the number part
+def _badge_num(badge_id: str) -> str:
+    return badge_id.split("_")[-1].lstrip("0") or "0"
+
+
+_TIER_FMT = {
+    "gold":   ("⟪{}⟫", "bold yellow"),
+    "red":    ("⟨{}⟩", "bold red"),
+    "purple": ("[{}]",  "bold magenta"),
+    "green":  ("({})",  "green"),
+}
+
+_TIER_ORDER = ["gold", "red", "purple", "green"]
+
+
+def _render_badge_panel(session: GameSession) -> Text:
+    """Render owned badge logos grouped by tier, one tier per line."""
+    owned_ids = {b.badge_id for b in session.badges}
+
+    t = Text()
+    for tier in _TIER_ORDER:
+        fmt, style = _TIER_FMT[tier]
+        badges_in_tier = [
+            bid for bid, b in ALL_BADGES.items()
+            if b.tier == tier and bid in owned_ids
+        ]
+        if not badges_in_tier:
+            t.append("\n")
+            continue
+        for bid in badges_in_tier:
+            num = _badge_num(bid)
+            t.append(fmt.format(num) + " ", style=style)
+        t.append("\n")
+    return t
 
 
 # ---------------------------------------------------------------------------
-# Draw (gacha) animation
+# ADVENTURE HUD (4-column: sprite 15% | badges 35% | stats 25% | loc 25%)
 # ---------------------------------------------------------------------------
 
-_GACHA_COLORS = ["red", "yellow", "green", "cyan", "magenta", "blue"]
+def render_adventure(session: GameSession, log_lines: list[str]) -> Layout:
+    """Render the adventure screen with HUD + log."""
+    layout = Layout()
+    layout.split_column(
+        Layout(name="hud", size=9),
+        Layout(name="log"),
+        Layout(name="footer", size=3),
+    )
 
+    sprite_lines = _get_sprite_lines(session)
+    sprite_text = "\n".join(sprite_lines)
 
-def render_draw_animation(badge: Badge, is_new: bool, refund: int,
-                           console: Console) -> None:
-    color = BADGE_COLORS.get(badge.tier, "dim")
-    tier_labels = {"green": "普通", "purple": "珍贵", "red": "稀有", "gold": "传说"}
-    tier_label = tier_labels.get(badge.tier, "???")
+    hp = session.stats.get("HP", 0)
+    atk = session.stats.get("ATK", 0)
+    def_ = session.stats.get("DEF", 0)
+    spd = session.stats.get("SPD", 0)
+    lck = session.stats.get("LCK", 0)
 
-    symbols = ["\u2660", "\u2663", "\u2665", "\u2666", "\u2605", "\u2606"]
-    for i in range(10):
-        c = _GACHA_COLORS[i % len(_GACHA_COLORS)]
-        s = symbols[i % len(symbols)]
-        speed = 0.06 + i * 0.03
-        console.print(f"\r  [{c}]  {s}  抽卡中... {s}  [/{c}]", end="")
-        sys.stdout.flush()
-        time.sleep(speed)
-    console.print()
+    stats_text = Text()
+    stats_text.append("HP  ")
+    stats_text.append(_stat_bar(hp, 100, 10), style="red")
+    stats_text.append(f" {hp:>3}\n")
+    stats_text.append("ATK ")
+    stats_text.append(_stat_bar(atk, 50, 10), style="yellow")
+    stats_text.append(f" {atk:>3}\n")
+    stats_text.append("DEF ")
+    stats_text.append(_stat_bar(def_, 50, 10), style="blue")
+    stats_text.append(f" {def_:>3}\n")
+    stats_text.append("SPD ")
+    stats_text.append(_stat_bar(spd, 50, 10), style="green")
+    stats_text.append(f" {spd:>3}\n")
+    stats_text.append("LCK ")
+    stats_text.append(_stat_bar(lck, 50, 10), style="magenta")
+    stats_text.append(f" {lck:>3}\n")
 
-    if is_new:
-        console.print(Panel(
-            f"[{color} bold]\u2605 新徽章！\u2605[/{color} bold]\n"
-            f"[{color} bold]{badge.name}[/{color} bold]\n"
-            f"[dim]{badge.description}[/dim]\n"
-            f"效果: [{color}]{badge.effect}[/{color}]  "
-            f"等级: [{color}]{tier_label}[/{color}]",
-            border_style=color, box=box.DOUBLE,
-        ))
-        msg(f"\u2605 新徽章: {badge.name} ({badge.effect})")
-    else:
-        console.print(f"  [{color}]{badge.name}[/{color}] [dim]— 已拥有！退还 {refund} 券[/dim]")
-        msg(f"重复徽章: {badge.name}, 退还 {refund} 券")
+    loc_name = session.location.name if session.location else "未知"
+    region = session.location.region if session.location else ""
+    connections = session.location.connections if session.location else []
+    connections_str = " ".join(connections[:3]) if connections else "—"
 
+    loc_text = Text()
+    loc_text.append("位置: ")
+    loc_text.append(loc_name, style="bold")
+    loc_text.append("\n")
+    loc_text.append(f"区域: {region}\n", style="dim")
+    loc_text.append(f"连接: {connections_str}\n", style="dim")
+    loc_text.append("\n奖券: ")
+    loc_text.append(str(session.tickets), style="bold yellow")
+    loc_text.append("\n")
 
-# ---------------------------------------------------------------------------
-# Events
-# ---------------------------------------------------------------------------
+    badge_text = _render_badge_panel(session)
 
-def render_event_prompt(text: str, console: Console) -> None:
-    console.print(Panel(
-        text + "\n\n[dim](60秒内回复，或留空跳过)[/dim]",
-        title="[bold yellow]\u26a0 Buddy 需要你！[/bold yellow]",
-        border_style="yellow", box=box.ROUNDED,
+    # 4-column HUD using Layout for precise ratio control
+    hud_inner = Layout()
+    hud_inner.split_row(
+        Layout(Panel(Text(sprite_text, style="bold"), border_style="dim", box=box.SIMPLE), name="sprite", ratio=15),
+        Layout(Panel(badge_text, title="徽章", border_style="cyan", box=box.SIMPLE), name="badges", ratio=35),
+        Layout(Panel(stats_text, title="属性", border_style="yellow", box=box.SIMPLE), name="stats", ratio=25),
+        Layout(Panel(loc_text, title="位置", border_style="blue", box=box.SIMPLE), name="loc", ratio=25),
+    )
+
+    layout["hud"].update(Panel(
+        hud_inner,
+        title=f"[bold cyan]✦ {session.companion_name} 的冒险 ✦[/bold cyan]",
+        border_style="cyan",
+        box=box.ROUNDED,
+        padding=(0, 0),
     ))
 
+    # Log panel — log lines DO contain Rich markup, parse them
+    log_text = Text()
+    for line in log_lines[-50:]:
+        try:
+            log_text.append_text(Text.from_markup(line + "\n"))
+        except Exception:
+            log_text.append(line + "\n")
 
-def render_event_result(text: str, console: Console) -> None:
-    console.print(f"  [italic]{text}[/italic]")
-    msg(f"[事件] {text}")
+    layout["log"].update(Panel(
+        log_text,
+        title="[bold]冒险日志[/bold]",
+        border_style="dim",
+        box=box.SIMPLE_HEAVY,
+    ))
+
+    layout["footer"].update(Panel(
+        Text(" Q/ESC 结束冒险并结算", style="dim"),
+        border_style="dim",
+        box=box.SIMPLE,
+    ))
+
+    return layout
 
 
 # ---------------------------------------------------------------------------
-# Game Over
+# BADGES SCREEN
 # ---------------------------------------------------------------------------
 
-def render_game_over(session: GameSession, saved: dict, log_path: str | None,
-                      console: Console) -> None:
-    console.print()
-    console.print(Panel("[bold]冒险结束！[/bold]", border_style="cyan", box=box.DOUBLE))
+def render_badges_screen(session: GameSession) -> Panel:
+    """Render the badge collection screen."""
+    owned_ids = {b.badge_id for b in session.badges}
+    owned, total = badge_progress(session)
 
-    stats_lines = [
-        f"  回合: {session.turn_count}",
-        f"  属性: " + ", ".join(f"{k}={session.stats.get(k, 0)}" for k in GAME_STAT_NAMES),
-        f"  道具: {len(session.inventory)}  技能: {len(session.skills)}  徽章: {badge_progress(session)[0]}/{badge_progress(session)[1]}",
-    ]
-    for line in stats_lines:
-        console.print(line)
+    table = Table(box=box.SIMPLE, expand=True, show_header=True)
+    table.add_column("徽章", width=12)
+    table.add_column("稀有度", width=6)
+    table.add_column("效果", width=16)
+    table.add_column("说明")
 
-    console.print("\n[bold]Roguelike 结算:[/bold]")
-    saved_something = False
-    if saved.get("items"):
-        console.print(f"  [green]\u2713[/green] 道具: {', '.join(i.name for i in saved['items'])}")
-        saved_something = True
-    if saved.get("skills"):
-        console.print(f"  [green]\u2713[/green] 技能: {', '.join(s.name for s in saved['skills'])}")
-        saved_something = True
-    if saved.get("badges"):
-        console.print(f"  [green]\u2713[/green] 徽章: {', '.join(b.name for b in saved['badges'])}")
-        saved_something = True
-    if saved.get("tickets", 0) > 0:
-        console.print(f"  [green]\u2713[/green] 抽奖券: {saved['tickets']}")
-        saved_something = True
-    if saved.get("stat_changes"):
-        for stat, amount in saved["stat_changes"].items():
-            console.print(f"  [green]\u2713[/green] 永久属性: {stat}+{amount}")
-            saved_something = True
-    if not saved_something:
-        console.print("  [dim]这次运气不太好...[/dim]")
-    if log_path:
-        console.print(f"\n  [dim]日志: {log_path}[/dim]")
-    console.print()
+    tiers = ["gold", "red", "purple", "green"]
+    tier_labels = {"gold": "传说", "red": "稀有", "purple": "珍贵", "green": "普通"}
+    for tier in tiers:
+        for badge_id, badge in ALL_BADGES.items():
+            if badge.tier != tier:
+                continue
+            color = BADGE_COLORS.get(tier, "white")
+            if badge_id in owned_ids:
+                table.add_row(
+                    f"[{color}]{badge.name}[/{color}]",
+                    f"[{color}]{tier_labels[tier]}[/{color}]",
+                    badge.effect,
+                    f"[dim]{badge.description}[/dim]",
+                )
+            else:
+                table.add_row(
+                    "[dim]???[/dim]",
+                    f"[dim]{tier_labels[tier]}[/dim]",
+                    "[dim]???[/dim]",
+                    "[dim]尚未解锁[/dim]",
+                )
+
+    return Panel(
+        table,
+        title=f"[bold]徽章图鉴  [{owned}/{total}][/bold]",
+        border_style="magenta",
+        box=box.DOUBLE,
+        subtitle="[dim]Q/ESC 返回[/dim]",
+    )
+
+
+# ---------------------------------------------------------------------------
+# GACHA SCREEN — single draw + 10-pull
+# ---------------------------------------------------------------------------
+
+GACHA_OPTIONS = ["单抽 (5 奖券)", "十连抽 (50 奖券，保底珍贵)"]
+MULTI_COST = TICKET_COST * 10
+
+
+def render_gacha_screen(
+    session: GameSession,
+    gacha_cursor: int = 0,
+    last_draw: list | None = None,     # list of (badge, is_new, refund)
+    animating: bool = False,
+) -> Panel:
+    """Render the gacha draw screen."""
+    owned, total = badge_progress(session)
+
+    t = Text()
+    t.append(f"  奖券余额: ")
+    t.append(str(session.tickets), style="bold yellow")
+    t.append(f"    已收集徽章: {owned}/{total}\n\n")
+
+    # Probability hint
+    t.append("  概率: ", style="dim")
+    for color, label in [("green", "普通60%"), ("magenta", "珍贵25%"), ("red", "稀有10%"), ("yellow", "传说5%")]:
+        t.append(f" {label} ", style=color)
+    t.append("\n\n")
+
+    # Draw options
+    for i, opt in enumerate(GACHA_OPTIONS):
+        if i == gacha_cursor:
+            t.append(f"  ▶  {opt}\n", style="bold cyan")
+        else:
+            t.append(f"     {opt}\n", style="dim")
+    t.append("\n")
+
+    # Results
+    if animating:
+        t.append("  ✦ ★ ◆ ✿ ♦ ✸ ❋\n", style="bold yellow")
+    elif last_draw is not None:
+        if not last_draw:
+            t.append("  奖券不足，无法抽奖！\n", style="bold red")
+        else:
+            tier_cn = {"green": "普通", "purple": "珍贵", "red": "稀有", "gold": "传说"}
+            for badge, is_new, refund in last_draw:
+                color = BADGE_COLORS.get(badge.tier, "white")
+                tag = tier_cn.get(badge.tier, "")
+                if is_new:
+                    t.append("  ✨ ", style="bold")
+                    t.append(f"【{badge.name}】", style=color)
+                    t.append(f"  {tag}  {badge.effect}\n", style="dim")
+                else:
+                    t.append("  ↩ ", style="dim")
+                    t.append(f"{badge.name}", style=color)
+                    t.append(f"  重复 → 退还{refund}券\n", style="dim")
+
+    return Panel(
+        t,
+        title="[bold yellow]✦ 扭蛋抽奖 ✦[/bold yellow]",
+        border_style="yellow",
+        box=box.DOUBLE,
+        subtitle="[dim]↑↓ 选择   Enter 抽奖   Q/ESC 返回[/dim]",
+    )

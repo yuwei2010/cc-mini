@@ -5,17 +5,12 @@ determining damage, speed determining who goes first.
 """
 from __future__ import annotations
 
-import math
 import random
 import time
 from dataclasses import dataclass, field
+from typing import Callable
 
-from rich.console import Console
-from rich.panel import Panel
-from rich.text import Text
-from rich import box
-
-from .types import GameSession, Monster, Item, Skill, ELEMENTS
+from .types import GameSession, Monster, Item, Skill
 
 
 # ---------------------------------------------------------------------------
@@ -146,8 +141,8 @@ def _generate_rewards(monster: Monster, session: GameSession) -> BattleResult:
 # ---------------------------------------------------------------------------
 
 def run_battle(session: GameSession, monster: Monster,
-                console: Console) -> BattleResult:
-    """Run an automatic turn-based battle. Returns BattleResult."""
+               log_fn: Callable[[str], None]) -> BattleResult:
+    """Run an automatic turn-based battle. Outputs via log_fn. Returns BattleResult."""
     name = session.companion_name
     player_hp = session.stats.get("HP", 1)
     player_atk = session.stats.get("ATK", 10)
@@ -157,7 +152,6 @@ def run_battle(session: GameSession, monster: Monster,
     monster_hp = monster.hp
     monster_max_hp = monster.hp
 
-    # Determine player element from best skill, or "light" default
     player_elem = "light"
     if session.skills:
         best_skill = max(session.skills, key=lambda s: s.power)
@@ -165,32 +159,19 @@ def run_battle(session: GameSession, monster: Monster,
 
     elem_mult_player = _element_multiplier(player_elem, monster.element)
     elem_mult_monster = _element_multiplier(monster.element, player_elem)
-
-    # Skill power bonus (best skill)
     skill_power = max((s.power for s in session.skills), default=0)
 
     log: list[str] = []
     round_num = 0
     start_hp = player_hp
 
-    # Battle header
-    console.print()
-    console.print(Panel(
-        f"[bold red]野生的 {monster.name} 出现了！[/bold red]\n"
-        f"[dim]{monster.description}[/dim]\n\n"
-        f"  Lv.{monster.level} {monster.species} [{monster.element}]\n"
-        f"  HP:{monster.hp}  ATK:{monster.atk}  DEF:{monster.defense}  SPD:{monster.spd}",
-        title="[bold]战斗开始[/bold]",
-        border_style="red",
-        box=box.HEAVY,
-    ))
-
-    time.sleep(0.8)
+    log_fn(f"⚔️  野生的 [bold red]{monster.name}[/bold red] 出现了！"
+           f"(Lv.{monster.level} {monster.element}元素  HP:{monster.hp})")
+    time.sleep(0.4)
 
     while player_hp > 0 and monster_hp > 0 and round_num < 20:
         round_num += 1
 
-        # Determine turn order by speed
         player_first = player_spd >= monster.spd
         if player_spd == monster.spd:
             player_first = random.random() < 0.5
@@ -198,70 +179,57 @@ def run_battle(session: GameSession, monster: Monster,
         def _player_attack() -> str:
             nonlocal monster_hp
             dmg = _calc_damage(player_atk, monster.defense, skill_power, elem_mult_player)
-            # Critical hit (LCK based)
             crit = ""
             lck = session.stats.get("LCK", 10)
-            if random.random() < lck / 200:  # max 50% crit at LCK=100
+            if random.random() < lck / 200:
                 dmg = int(dmg * 1.5)
                 crit = " [yellow]暴击！[/yellow]"
             monster_hp = max(0, monster_hp - dmg)
-            return f"  {name} 发起攻击！造成 [bold]{dmg}[/bold] 点伤害！{crit} (怪物HP: {monster_hp}/{monster_max_hp})"
+            return f"   {name} 攻击！造成 [bold]{dmg}[/bold] 伤害{crit} → 怪物HP {monster_hp}/{monster_max_hp}"
 
         def _monster_attack() -> str:
             nonlocal player_hp
             dmg = _calc_damage(monster.atk, player_def, 0, elem_mult_monster)
             player_hp = max(0, player_hp - dmg)
-            return f"  {monster.name} 反击！造成 [bold]{dmg}[/bold] 点伤害！ (你的HP: {player_hp})"
-
-        console.print(f"\n[dim]— 第 {round_num} 回合 —[/dim]")
-        time.sleep(0.3)
+            return f"   {monster.name} 反击！造成 [bold red]{dmg}[/bold red] 伤害 → HP {player_hp}"
 
         if player_first:
             msg = _player_attack()
-            console.print(msg)
+            log_fn(msg)
             log.append(msg)
-            time.sleep(0.3)
+            time.sleep(0.25)
             if monster_hp > 0:
                 msg = _monster_attack()
-                console.print(msg)
+                log_fn(msg)
                 log.append(msg)
-                time.sleep(0.3)
+                time.sleep(0.25)
         else:
             msg = _monster_attack()
-            console.print(msg)
+            log_fn(msg)
             log.append(msg)
-            time.sleep(0.3)
+            time.sleep(0.25)
             if player_hp > 0:
                 msg = _player_attack()
-                console.print(msg)
+                log_fn(msg)
                 log.append(msg)
-                time.sleep(0.3)
+                time.sleep(0.25)
 
-    # Battle result
     hp_lost = start_hp - player_hp
-    console.print()
 
     if monster_hp <= 0:
-        # Victory
-        console.print(Panel(
-            f"[bold green]胜利！[/bold green] {name} 击败了 {monster.name}！\n"
-            f"  耗时 {round_num} 回合，损失 {hp_lost} HP",
-            border_style="green",
-        ))
-
         result = _generate_rewards(monster, session)
         result.rounds = round_num
         result.hp_lost = hp_lost
         result.log = log
+        reward_parts = []
+        if result.reward_tickets:
+            reward_parts.append(f"+{result.reward_tickets}券")
+        if result.reward_stat:
+            reward_parts.append(f"{result.reward_stat[0]}+{result.reward_stat[1]}")
+        rewards_str = "  ".join(reward_parts) if reward_parts else "无额外奖励"
+        log_fn(f"   [bold green]胜利！[/bold green] 击败了 {monster.name}！"
+               f"({round_num}回合  -{hp_lost}HP)  {rewards_str}")
         return result
-
     else:
-        # Defeat
-        console.print(Panel(
-            f"[bold red]战败...[/bold red] {name} 被 {monster.name} 击倒了。\n"
-            f"  坚持了 {round_num} 回合",
-            border_style="red",
-        ))
-        return BattleResult(
-            won=False, rounds=round_num, hp_lost=hp_lost, log=log,
-        )
+        log_fn(f"   [bold red]战败...[/bold red] {name} 被 {monster.name} 击倒了。(坚持了{round_num}回合)")
+        return BattleResult(won=False, rounds=round_num, hp_lost=hp_lost, log=log)

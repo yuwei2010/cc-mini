@@ -99,16 +99,17 @@ def _adjusted_draw_probs(lck: int) -> dict[str, float]:
     return probs
 
 
-def draw_badge(session: GameSession) -> tuple[Badge | None, bool, int]:
+def draw_badge(session: GameSession, free: bool = False) -> tuple[Badge | None, bool, int]:
     """Perform a gacha draw.
 
     Returns (badge, is_new, refund_tickets).
     Returns (None, False, 0) if not enough tickets.
+    If free=True, skip ticket deduction (used by multi-draw).
     """
-    if session.tickets < TICKET_COST:
-        return None, False, 0
-
-    session.tickets -= TICKET_COST
+    if not free:
+        if session.tickets < TICKET_COST:
+            return None, False, 0
+        session.tickets -= TICKET_COST
 
     # Roll tier
     probs = _adjusted_draw_probs(session.stats.get("LCK", 10))
@@ -141,3 +142,64 @@ def draw_badge(session: GameSession) -> tuple[Badge | None, bool, int]:
 def badge_progress(session: GameSession) -> tuple[int, int]:
     """Return (owned, total) badge counts."""
     return len(session.badges), len(ALL_BADGES)
+
+
+def draw_badge_multi(session: GameSession, count: int = 10) -> list[tuple[Badge | None, bool, int]]:
+    """10-pull gacha: draw `count` badges with guaranteed purple+ on last draw.
+
+    Returns list of (badge, is_new, refund). Empty list if insufficient tickets.
+    """
+    cost = TICKET_COST * count
+    if session.tickets < cost:
+        return []
+
+    results: list[tuple[Badge | None, bool, int]] = []
+    has_rare = False
+
+    for i in range(count):
+        badge, is_new, refund = draw_badge(session, free=True)  # don't deduct per-draw
+        if badge and badge.tier in ("purple", "red", "gold"):
+            has_rare = True
+        results.append((badge, is_new, refund))
+
+    # Guarantee: if no purple+ in first 9, force the 10th to be purple+
+    if not has_rare and results:
+        # Redo last draw with forced high tier
+        session.tickets += results[-1][2]  # undo refund of last draw
+        if results[-1][1] and results[-1][0]:
+            # undo badge add from last draw
+            owned_ids = {b.badge_id for b in session.badges}
+            if results[-1][0].badge_id in owned_ids:
+                session.badges = [b for b in session.badges if b.badge_id != results[-1][0].badge_id]
+        results[-1] = _forced_rare_draw(session)
+
+    # Deduct total cost (individual draws were free)
+    session.tickets -= cost
+    return results
+
+
+def _forced_rare_draw(session: GameSession) -> tuple[Badge, bool, int]:
+    """Draw a badge guaranteed purple or better."""
+    # Roll among purple/red/gold only
+    probs = {"purple": 0.70, "red": 0.20, "gold": 0.10}
+    roll = random.random()
+    cumulative = 0.0
+    chosen_tier = "purple"
+    for tier, p in probs.items():
+        cumulative += p
+        if roll < cumulative:
+            chosen_tier = tier
+            break
+
+    pool = BADGES_BY_TIER[chosen_tier]
+    badge_id = random.choice(pool)
+    badge = ALL_BADGES[badge_id]
+
+    owned_ids = {b.badge_id for b in session.badges}
+    if badge_id in owned_ids:
+        refund = DUPLICATE_REFUND.get(chosen_tier, 0)
+        session.tickets += refund
+        return badge, False, refund
+
+    session.badges.append(badge)
+    return badge, True, 0
